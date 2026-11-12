@@ -1,0 +1,1034 @@
+-- ============================================================
+-- DeepInspector · Delta Executor · Mobile-Adapted
+-- Injetável · Client-side · Luau
+-- Versão: 2.0.0
+-- Uso: injeta no Delta enquanto dentro do jogo no Roblox
+-- ============================================================
+
+-- ============================================================
+-- SERVICES — com pcall para ambientes restritos
+-- ============================================================
+local function S(name)
+    local ok, svc = pcall(function() return game:GetService(name) end)
+    return ok and svc or nil
+end
+
+local Players             = S("Players")
+local RunService          = S("RunService")
+local HttpService         = S("HttpService")
+local Workspace           = game.Workspace or workspace
+local ReplicatedStorage   = S("ReplicatedStorage")
+local ServerScriptService = S("ServerScriptService")
+local ServerStorage       = S("ServerStorage")
+local StarterPlayer       = S("StarterPlayer")
+local StarterPack         = S("StarterPack")
+local Lighting            = S("Lighting")
+local SoundService        = S("SoundService")
+local VirtualInputManager = S("VirtualInputManager")
+
+local LocalPlayer = Players and Players.LocalPlayer
+local Camera      = Workspace and Workspace.CurrentCamera
+
+-- ============================================================
+-- UTILS
+-- ============================================================
+local function FullPath(obj)
+    if not obj or not obj.Parent then return obj and obj.Name or "nil" end
+    local parts, cur = {}, obj
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local function SafeGet(obj, prop)
+    local ok, v = pcall(function() return obj[prop] end)
+    return ok and v or nil
+end
+
+local function IsScript(obj)
+    return obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript")
+end
+
+local function ScriptSource(obj)
+    if not IsScript(obj) then return nil end
+    local ok, src = pcall(function() return obj.Source end)
+    if ok and src and #src > 0 then return src end
+    return nil
+end
+
+local function SearchSource(src, patterns)
+    if not src then return {} end
+    local hits = {}
+    for _, pat in ipairs(patterns) do
+        local lineNum = 0
+        for line in src:gmatch("[^\n]+") do
+            lineNum = lineNum + 1
+            if line:lower():find(pat:lower(), 1, true) then
+                table.insert(hits, { pattern = pat, line = lineNum, text = line:gsub("^%s+", ""):sub(1, 120) })
+            end
+        end
+    end
+    return hits
+end
+
+local function ShortSource(src, maxLines)
+    if not src then return "(unavailable)" end
+    maxLines = maxLines or 40
+    local lines, n = {}, 0
+    for line in src:gmatch("[^\n]+") do
+        n = n + 1
+        if n > maxLines then table.insert(lines, ("...+%d linhas"):format(n)); break end
+        table.insert(lines, line)
+    end
+    return table.concat(lines, "\n")
+end
+
+local function CountLines(src)
+    if not src then return 0 end
+    return select(2, src:gsub("\n","")) + 1
+end
+
+-- ============================================================
+-- RAÍZES ESCANEÁVEIS (client-side, o que o Delta consegue ver)
+-- ============================================================
+local ROOTS = {}
+for _, svc in ipairs({
+    StarterPlayer, StarterPack, ReplicatedStorage,
+    ServerScriptService, ServerStorage,
+    Workspace, Lighting, SoundService,
+}) do
+    if svc then table.insert(ROOTS, svc) end
+end
+
+-- ============================================================
+-- RELATÓRIO — estrutura única
+-- ============================================================
+local Report = {
+    metadata      = { generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"), version = "2.0.0" },
+    A_structure   = {},
+    B_weapons     = {},
+    C_aim         = {},
+    D_camera      = {},
+    E_shiftlock   = {},
+    F_rotation    = {},
+    G_portals     = {},
+    H_teleport    = {},
+    I_remotes     = {},
+    J_security    = {},
+    K_scripts     = {},
+    L_unverified  = {
+        "Scripts server-side podem não ter .Source acessível no contexto client/executor.",
+        "Resultados HIPÓTESE e DESCONHECIDO requerem inspeção manual no Studio.",
+        "Validações server-side não são verificáveis pelo client.",
+        "Comportamentos de câmera e input dependem de execução em jogo.",
+    },
+}
+
+-- ============================================================
+-- A — ESTRUTURA
+-- ============================================================
+local function MapObject(obj, depth)
+    depth = depth or 0
+    local entry = {
+        name = obj.Name, class = obj.ClassName,
+        path = FullPath(obj), depth = depth,
+        children_count = 0, scripts = {}, properties = {},
+    }
+    local relevantProps = {
+        BasePart   = {"Size","Position","Anchored","CanCollide"},
+        Humanoid   = {"WalkSpeed","JumpPower","AutoRotate","Health","MaxHealth"},
+        Camera     = {"CameraType","CameraSubject","FieldOfView"},
+        Tool       = {"RequiresHandle","ToolTip","GripForward","GripPos"},
+        RemoteEvent= {}, RemoteFunction={},
+        Sound      = {"SoundId","Volume","Looped"},
+        Animation  = {"AnimationId"},
+    }
+    for base, props in pairs(relevantProps) do
+        if obj:IsA(base) then
+            for _, p in ipairs(props) do
+                local v = SafeGet(obj, p)
+                if v ~= nil then entry.properties[p] = tostring(v) end
+            end
+        end
+    end
+    if IsScript(obj) then
+        local src = ScriptSource(obj)
+        table.insert(entry.scripts, { name=obj.Name, class=obj.ClassName, path=FullPath(obj), lines=CountLines(src) })
+        table.insert(Report.K_scripts, { name=obj.Name, class=obj.ClassName, path=FullPath(obj), lines=CountLines(src) })
+    end
+    if depth < 7 then
+        for _, child in ipairs(obj:GetChildren()) do
+            entry.children_count = entry.children_count + 1
+            if depth < 4 then
+                table.insert(entry, MapObject(child, depth+1))
+            end
+        end
+    end
+    return entry
+end
+
+local function RunA()
+    for _, root in ipairs(ROOTS) do
+        table.insert(Report.A_structure, MapObject(root, 0))
+    end
+end
+
+-- ============================================================
+-- B — ARMAS
+-- ============================================================
+local function AnalyzeWeapon(tool)
+    local entry = {
+        name=tool.Name, path=FullPath(tool),
+        handle_found = tool:FindFirstChild("Handle") ~= nil,
+        grip = {
+            GripForward = SafeGet(tool,"GripForward") and tostring(SafeGet(tool,"GripForward")),
+            GripPos     = SafeGet(tool,"GripPos")     and tostring(SafeGet(tool,"GripPos")),
+        },
+        scripts={}, activation_flow={}, aim_evidence={},
+        anim_evidence={}, cooldown_evidence={}, confidence="HIPÓTESE",
+    }
+    for _, obj in ipairs(tool:GetDescendants()) do
+        if IsScript(obj) then
+            local src = ScriptSource(obj)
+            local se = { name=obj.Name, class=obj.ClassName, path=FullPath(obj), lines=CountLines(src) }
+            if src then
+                for _,h in ipairs(SearchSource(src,{"Activated","MouseButton1","Equipped","Unequipped"})) do
+                    table.insert(entry.activation_flow,{script=obj.Name,line=h.line,text=h.text})
+                end
+                for _,h in ipairs(SearchSource(src,{"Mouse.Hit","UnitRay","ScreenPointToRay","ViewportPointToRay","Raycast","LookVector","lookAt"})) do
+                    table.insert(entry.aim_evidence,{script=obj.Name,line=h.line,text=h.text})
+                end
+                for _,h in ipairs(SearchSource(src,{"LoadAnimation","AnimationTrack",":Play()","AdjustSpeed"})) do
+                    table.insert(entry.anim_evidence,{script=obj.Name,line=h.line,text=h.text})
+                end
+                for _,h in ipairs(SearchSource(src,{"debounce","cooldown","tick()","os.clock","task.wait","wait("})) do
+                    table.insert(entry.cooldown_evidence,{script=obj.Name,line=h.line,text=h.text})
+                end
+                entry.confidence = #entry.activation_flow > 0 and "CONFIRMADO" or "PROVÁVEL"
+                se.preview = ShortSource(src, 30)
+            else
+                entry.confidence = "DESCONHECIDO"
+            end
+            table.insert(entry.scripts, se)
+        end
+    end
+    return entry
+end
+
+local function RunB()
+    local scanned = {}
+    local function ScanForTools(root)
+        for _, obj in ipairs(root:GetDescendants()) do
+            if obj:IsA("Tool") and not scanned[obj] then
+                scanned[obj] = true
+                table.insert(Report.B_weapons, AnalyzeWeapon(obj))
+            end
+        end
+    end
+    for _, r in ipairs(ROOTS) do ScanForTools(r) end
+end
+
+-- ============================================================
+-- C — MIRA
+-- ============================================================
+local function RunC()
+    Report.C_aim = {
+        ray_origin    ={status="DESCONHECIDO",evidence={}},
+        ray_direction ={status="DESCONHECIDO",evidence={}},
+        hit_calc      ={status="DESCONHECIDO",evidence={}},
+        obstruction   ={status="DESCONHECIDO",evidence={}},
+        target_select ={status="DESCONHECIDO",evidence={}},
+        shiftlock_aim ={status="DESCONHECIDO",evidence={}},
+        barrel_align  ={status="DESCONHECIDO",evidence={}},
+    }
+    local aimPatterns = {
+        "Mouse.Hit","UnitRay","Mouse.Target",
+        "ScreenPointToRay","ViewportPointToRay",
+        "Workspace:Raycast","RaycastParams",
+        "CFrame.lookAt","LookVector",
+        "WorldToViewportPoint","WorldToScreenPoint",
+        "FilterDescendantsInstances","FilterType",
+    }
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if src then
+                    for _,h in ipairs(SearchSource(src, aimPatterns)) do
+                        local ev = {script=FullPath(obj),line=h.line,text=h.text}
+                        if h.pattern:find("UnitRay") or h.pattern:find("ScreenPointToRay") or h.pattern:find("ViewportPointToRay") then
+                            table.insert(Report.C_aim.ray_origin.evidence,ev)
+                            table.insert(Report.C_aim.ray_direction.evidence,ev)
+                            Report.C_aim.ray_origin.status    = "CONFIRMADO"
+                            Report.C_aim.ray_direction.status = "CONFIRMADO"
+                        end
+                        if h.pattern:find("Raycast") then
+                            table.insert(Report.C_aim.hit_calc.evidence,ev)
+                            Report.C_aim.hit_calc.status = "CONFIRMADO"
+                        end
+                        if h.pattern:find("FilterDescendants") or h.pattern:find("FilterType") then
+                            table.insert(Report.C_aim.obstruction.evidence,ev)
+                            Report.C_aim.obstruction.status = "CONFIRMADO"
+                        end
+                        if h.pattern:find("Target") or h.pattern:find("WorldToViewport") then
+                            table.insert(Report.C_aim.target_select.evidence,ev)
+                            Report.C_aim.target_select.status = "PROVÁVEL"
+                        end
+                        if h.pattern:find("LookVector") or h.pattern:find("lookAt") then
+                            table.insert(Report.C_aim.barrel_align.evidence,ev)
+                            Report.C_aim.barrel_align.status = "PROVÁVEL"
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- D — CÂMERA
+-- ============================================================
+local function RunD()
+    local cam = Camera
+    Report.D_camera = {
+        current_state = {
+            CameraType    = cam and SafeGet(cam,"CameraType") and tostring(SafeGet(cam,"CameraType")) or "N/A",
+            CameraSubject = cam and SafeGet(cam,"CameraSubject") and tostring(SafeGet(cam,"CameraSubject")) or "N/A",
+            FieldOfView   = cam and SafeGet(cam,"FieldOfView") or "N/A",
+            ViewportSize  = cam and SafeGet(cam,"ViewportSize") and tostring(SafeGet(cam,"ViewportSize")) or "N/A",
+        },
+        evidence={},
+    }
+    local camPatterns = {
+        "CameraType","CameraSubject","CameraOffset",
+        "Camera.CFrame","Camera.Focus","FieldOfView",
+        "RenderStepped","ViewportSize","GetRenderCFrame",
+    }
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if src then
+                    for _,h in ipairs(SearchSource(src, camPatterns)) do
+                        table.insert(Report.D_camera.evidence,{script=FullPath(obj),line=h.line,pattern=h.pattern,text=h.text})
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- E — SHIFT LOCK
+-- ============================================================
+local function RunE()
+    Report.E_shiftlock = {
+        engine_setting = {
+            DevEnableMouseLock     = StarterPlayer and tostring(SafeGet(StarterPlayer,"DevEnableMouseLock")) or "N/A",
+            CameraMaxZoomDistance  = StarterPlayer and tostring(SafeGet(StarterPlayer,"CameraMaxZoomDistance")) or "N/A",
+            CameraMinZoomDistance  = StarterPlayer and tostring(SafeGet(StarterPlayer,"CameraMinZoomDistance")) or "N/A",
+            DevComputerMovementMode= StarterPlayer and tostring(SafeGet(StarterPlayer,"DevComputerMovementMode")) or "N/A",
+        },
+        behavior_table = {
+            {aspect="MouseBehavior",   on="LockCenter",on_status="HIPÓTESE", off="Default",    off_status="HIPÓTESE"},
+            {aspect="MouseIconEnabled",on="false",     on_status="HIPÓTESE", off="true",       off_status="HIPÓTESE"},
+            {aspect="CameraType",      on="Custom",    on_status="HIPÓTESE", off="Follow",     off_status="HIPÓTESE"},
+            {aspect="Personagem gira", on="sim",       on_status="HIPÓTESE", off="não",        off_status="HIPÓTESE"},
+            {aspect="Mira modificada", on="sim",       on_status="HIPÓTESE", off="não",        off_status="HIPÓTESE"},
+            {aspect="Cursor visível",  on="não",       on_status="HIPÓTESE", off="sim",        off_status="HIPÓTESE"},
+        },
+        evidence={},
+    }
+    local slPatterns = {
+        "ShiftLock","LockCenter","MouseBehavior",
+        "MouseIconEnabled","LockMouse","CenterMouse",
+        "ConfineMouse","CameraOffset",
+        "DevEnableMouseLock","MouseLockOffset",
+    }
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if src then
+                    for _,h in ipairs(SearchSource(src, slPatterns)) do
+                        table.insert(Report.E_shiftlock.evidence,{script=FullPath(obj),line=h.line,pattern=h.pattern,text=h.text})
+                    end
+                end
+            end
+        end
+    end
+    if #Report.E_shiftlock.evidence > 0 then
+        for _, row in ipairs(Report.E_shiftlock.behavior_table) do
+            row.on_status  = "PROVÁVEL"
+            row.off_status = "PROVÁVEL"
+        end
+    end
+end
+
+-- ============================================================
+-- F — ROTAÇÃO
+-- ============================================================
+local function RunF()
+    Report.F_rotation = {
+        humanoid_autorotate = "N/A",
+        evidence={}, summary={},
+    }
+    if LocalPlayer and LocalPlayer.Character then
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then Report.F_rotation.humanoid_autorotate = tostring(SafeGet(hum,"AutoRotate")) end
+    end
+    local rotPatterns = {
+        "AutoRotate","HumanoidRootPart","AlignOrientation",
+        "BodyGyro","Motor6D","CFrame.lookAt",
+        "RenderStepped","Heartbeat","LookVector","BodyAngularVelocity",
+    }
+    local flags = { AlignOrientation=false, BodyGyro=false, AutoRotate=false }
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if src then
+                    for _,h in ipairs(SearchSource(src, rotPatterns)) do
+                        table.insert(Report.F_rotation.evidence,{script=FullPath(obj),line=h.line,pattern=h.pattern,text=h.text})
+                        if h.pattern:find("AlignOrientation") then flags.AlignOrientation=true end
+                        if h.pattern:find("BodyGyro")         then flags.BodyGyro=true end
+                        if h.pattern:find("AutoRotate")       then flags.AutoRotate=true end
+                    end
+                end
+            end
+        end
+    end
+    Report.F_rotation.summary = {
+        uses_AlignOrientation = {found=flags.AlignOrientation, status=flags.AlignOrientation and "CONFIRMADO" or "DESCONHECIDO"},
+        uses_BodyGyro         = {found=flags.BodyGyro,         status=flags.BodyGyro and "CONFIRMADO" or "DESCONHECIDO"},
+        modifies_AutoRotate   = {found=flags.AutoRotate,       status=flags.AutoRotate and "CONFIRMADO" or "DESCONHECIDO"},
+    }
+end
+
+-- ============================================================
+-- G — PORTAIS
+-- ============================================================
+local function RunG()
+    Report.G_portals = {
+        scripts_found={}, creation_flow={}, position_calc={},
+        orientation_calc={}, surface_selection={}, model_creation={},
+        portal_linkage={}, teleport_execution={}, camera_behavior={},
+        confidence="DESCONHECIDO",
+    }
+    local portalPatterns = {
+        "Portal","PortalGun","CreatePortal","PlacePortal","ShootPortal",
+        "PortalHandler","Teleport","Raycast","RemoteEvent","RemoteFunction",
+        "Touched","GetTouchingParts","SetPrimaryPartCFrame","PivotTo",
+        "Normal","RaycastResult","CFrame.new",
+    }
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if src and (src:lower():find("portal") or src:lower():find("portalgun")) then
+                    local se = {name=obj.Name,path=FullPath(obj),class=obj.ClassName,hits={}}
+                    for _,h in ipairs(SearchSource(src, portalPatterns)) do
+                        table.insert(se.hits,{line=h.line,pattern=h.pattern,text=h.text})
+                        local ev={script=FullPath(obj),line=h.line,text=h.text}
+                        if h.pattern:find("CreatePortal") or h.pattern:find("PlacePortal") or h.pattern:find("ShootPortal") then
+                            table.insert(Report.G_portals.creation_flow,ev)
+                            Report.G_portals.confidence="CONFIRMADO"
+                        end
+                        if h.pattern:find("Raycast") or h.pattern:find("Normal") then
+                            table.insert(Report.G_portals.position_calc,ev)
+                            table.insert(Report.G_portals.surface_selection,ev)
+                        end
+                        if h.pattern:find("CFrame") then table.insert(Report.G_portals.orientation_calc,ev) end
+                        if h.pattern:find("Teleport") or h.pattern:find("Touched") then table.insert(Report.G_portals.teleport_execution,ev) end
+                        if h.pattern:find("RemoteEvent") or h.pattern:find("RemoteFunction") then table.insert(Report.G_portals.portal_linkage,ev) end
+                        if h.pattern:find("Instance.new") or h.pattern:find("Clone") then table.insert(Report.G_portals.model_creation,ev) end
+                    end
+                    table.insert(Report.G_portals.scripts_found, se)
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- H — TELEPORTE
+-- ============================================================
+local function RunH()
+    Report.H_teleport = { evidence={}, confidence="DESCONHECIDO" }
+    local tpPatterns = {
+        "SetPrimaryPartCFrame","PivotTo","CFrame.new",
+        "Touched","GetTouchingParts","Teleport","RootPart",
+    }
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if src and src:lower():find("portal") then
+                    for _,h in ipairs(SearchSource(src, tpPatterns)) do
+                        table.insert(Report.H_teleport.evidence,{script=FullPath(obj),line=h.line,pattern=h.pattern,text=h.text})
+                        Report.H_teleport.confidence="PROVÁVEL"
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- I — REMOTES
+-- ============================================================
+local function RunI()
+    Report.I_remotes = {}
+    local function FindRemotes(root)
+        for _, obj in ipairs(root:GetDescendants()) do
+            if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") or obj:IsA("BindableEvent") then
+                local entry={
+                    name=obj.Name, class=obj.ClassName, path=FullPath(obj),
+                    callers={}, apparent_function="DESCONHECIDO",
+                    server_handler="DESCONHECIDO", validations={},
+                }
+                for _, sroot in ipairs(ROOTS) do
+                    for _, sobj in ipairs(sroot:GetDescendants()) do
+                        if IsScript(sobj) then
+                            local src = ScriptSource(sobj)
+                            if src and src:find(obj.Name,1,true) then
+                                for _,h in ipairs(SearchSource(src,{
+                                    obj.Name,"FireServer","FireClient","FireAllClients",
+                                    "InvokeServer","InvokeClient",
+                                    "OnServerEvent","OnClientEvent","OnServerInvoke","OnClientInvoke",
+                                })) do
+                                    table.insert(entry.callers,{script=FullPath(sobj),line=h.line,text=h.text,pattern=h.pattern})
+                                    if h.pattern:find("FireServer")     then entry.apparent_function="Cliente → Servidor" end
+                                    if h.pattern:find("OnServerEvent") or h.pattern:find("OnServerInvoke") then
+                                        entry.server_handler=FullPath(sobj).." L"..h.line
+                                        entry.apparent_function="Recebido no servidor"
+                                    end
+                                    if h.pattern:find("FireAllClients") or h.pattern:find("FireClient") then
+                                        entry.apparent_function="Servidor → Cliente(s)"
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                table.insert(Report.I_remotes, entry)
+            end
+        end
+    end
+    for _, r in ipairs(ROOTS) do FindRemotes(r) end
+end
+
+-- ============================================================
+-- J — SEGURANÇA
+-- ============================================================
+local function RunJ()
+    Report.J_security = {}
+    for _, root in ipairs(ROOTS) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            if IsScript(obj) then
+                local src = ScriptSource(obj)
+                if not src then goto continue end
+                local fireLines  = {}; for _,h in ipairs(SearchSource(src,{"FireServer","InvokeServer"})) do table.insert(fireLines,h.line) end
+                local distLines  = {}; for _,h in ipairs(SearchSource(src,{"Magnitude","Distance","maxDistance"})) do table.insert(distLines,h.line) end
+                local cdLines    = {}; for _,h in ipairs(SearchSource(src,{"debounce","cooldown","tick()","os.clock"})) do table.insert(cdLines,h.line) end
+                local createLines= {}; for _,h in ipairs(SearchSource(src,{"Instance.new",":Clone()"})) do table.insert(createLines,h.line) end
+                local lsLines    = {}; for _,h in ipairs(SearchSource(src,{"loadstring"})) do table.insert(lsLines,h.line) end
+                local authLines  = {}; for _,h in ipairs(SearchSource(src,{"GetPlayerFromCharacter","assert(","error(","FindFirstChild.*Players"})) do table.insert(authLines,h.line) end
+
+                if #fireLines > 0 and #cdLines == 0 then
+                    table.insert(Report.J_security,{
+                        file=FullPath(obj), severity="MÉDIO", status="PROVÁVEL",
+                        issue="FireServer/InvokeServer sem cooldown visível",
+                        impact="Spam de eventos, possível abuso de mecânicas",
+                        evidence="FireServer nas linhas: "..table.concat(fireLines,", "),
+                        fix="Adicionar debounce ou cooldown server-side antes de processar",
+                    })
+                end
+                if #fireLines > 0 and #distLines == 0 then
+                    table.insert(Report.J_security,{
+                        file=FullPath(obj), severity="MÉDIO", status="PROVÁVEL",
+                        issue="FireServer sem verificação de distância",
+                        impact="Jogador pode acionar eventos a qualquer distância",
+                        evidence="FireServer nas linhas: "..table.concat(fireLines,", ").."; sem Magnitude",
+                        fix="Validar distância no servidor antes de processar",
+                    })
+                end
+                if #lsLines > 0 then
+                    table.insert(Report.J_security,{
+                        file=FullPath(obj), severity="ALTO", status="CONFIRMADO",
+                        issue="loadstring() encontrado",
+                        impact="Execução de código dinâmico — alto risco",
+                        evidence="Linhas: "..table.concat(lsLines,", "),
+                        fix="Remover loadstring; usar módulos estáticos",
+                    })
+                end
+                if obj:IsA("Script") and #createLines > 0 and #authLines == 0 then
+                    table.insert(Report.J_security,{
+                        file=FullPath(obj), severity="BAIXO", status="HIPÓTESE",
+                        issue="Criação de Instance sem verificação de autorização visível",
+                        impact="Possível criação de objetos não autorizada",
+                        evidence="Instance.new/:Clone() nas linhas: "..table.concat(createLines,", "),
+                        fix="Validar player autorizado antes de criar objetos",
+                    })
+                end
+                ::continue::
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- EXPORTAÇÃO — gera texto completo copiável
+-- ============================================================
+local function BuildTextReport()
+    local L = {}
+    local function W(s) table.insert(L, tostring(s or "")) end
+    local function HR() W(("─"):rep(70)) end
+    local function H1(t) W("") HR() W("  ■ "..t) HR() end
+    local function H2(t) W("  ┌─ "..t) end
+    local function KV(k,v) W("    "..k.." : "..tostring(v)) end
+
+    W("╔══════════════════════════════════════════════════════════════════════╗")
+    W("║         DEEP INSPECTOR — RELATÓRIO TÉCNICO COMPLETO                 ║")
+    W("╚══════════════════════════════════════════════════════════════════════╝")
+    W("  Gerado   : "..Report.metadata.generated_at)
+    W("  Versão   : "..Report.metadata.version)
+    W("  Executor : Delta (client-side)")
+
+    -- A
+    H1("A. ESTRUTURA DO JOGO")
+    for _, node in ipairs(Report.A_structure) do
+        H2(node.path.." ["..node.class.."]")
+        KV("Filhos diretos", node.children_count)
+        if next(node.properties) then
+            W("    Propriedades:")
+            for k,v in pairs(node.properties) do W("      "..k.." = "..v) end
+        end
+        if #node.scripts > 0 then
+            W("    Scripts:")
+            for _, s in ipairs(node.scripts) do W("      "..s.class.." "..s.name.." ("..s.lines.." linhas)") end
+        end
+    end
+
+    -- B
+    H1("B. SISTEMA DE ARMAS")
+    if #Report.B_weapons == 0 then W("  Nenhuma Tool encontrada nas raízes acessíveis.") end
+    for _, w in ipairs(Report.B_weapons) do
+        H2(w.name.." — "..w.confidence)
+        KV("Caminho", w.path)
+        KV("Handle", w.handle_found)
+        KV("GripForward", w.grip.GripForward or "N/A")
+        KV("GripPos", w.grip.GripPos or "N/A")
+        KV("Scripts", #w.scripts)
+        KV("Evidências ativação", #w.activation_flow)
+        KV("Evidências mira", #w.aim_evidence)
+        KV("Evidências animação", #w.anim_evidence)
+        KV("Evidências cooldown", #w.cooldown_evidence)
+        if #w.activation_flow > 0 then
+            W("    Fluxo de ativação:")
+            for _, ev in ipairs(w.activation_flow) do W("      L"..ev.line.." ["..ev.script.."] "..ev.text) end
+        end
+        if #w.aim_evidence > 0 then
+            W("    Evidências de mira:")
+            for _, ev in ipairs(w.aim_evidence) do W("      L"..ev.line.." ["..ev.script.."] "..ev.text) end
+        end
+    end
+
+    -- C
+    H1("C. SISTEMA DE MIRA")
+    for field, data in pairs(Report.C_aim) do
+        H2(field.." ["..data.status.."]")
+        for _, ev in ipairs(data.evidence) do W("    L"..ev.line.." ["..ev.script.."] "..ev.text) end
+        if #data.evidence == 0 then W("    (sem evidência encontrada)") end
+    end
+
+    -- D
+    H1("D. CÂMERA")
+    H2("Estado atual")
+    for k,v in pairs(Report.D_camera.current_state) do KV(k,v) end
+    H2("Evidências em scripts ("..#Report.D_camera.evidence..")")
+    for _, ev in ipairs(Report.D_camera.evidence) do
+        W("    L"..ev.line.." ["..ev.script.."] "..ev.text)
+    end
+
+    -- E
+    H1("E. SHIFT LOCK")
+    H2("Configurações engine")
+    for k,v in pairs(Report.E_shiftlock.engine_setting) do KV(k,v) end
+    H2("Tabela de comportamento")
+    W("    "..("─"):rep(66))
+    W(string.format("    %-28s | %-14s | %-14s | %s","Aspecto","ShiftLock ON","ShiftLock OFF","Status"))
+    W("    "..("─"):rep(66))
+    for _, row in ipairs(Report.E_shiftlock.behavior_table) do
+        W(string.format("    %-28s | %-14s | %-14s | %s",row.aspect,row.on,row.off,row.on_status))
+    end
+    W("    "..("─"):rep(66))
+    H2("Evidências em scripts ("..#Report.E_shiftlock.evidence..")")
+    for _, ev in ipairs(Report.E_shiftlock.evidence) do
+        W("    L"..ev.line.." ["..ev.script.."] "..ev.text)
+    end
+
+    -- F
+    H1("F. ROTAÇÃO DO PERSONAGEM")
+    KV("Humanoid.AutoRotate", Report.F_rotation.humanoid_autorotate)
+    H2("Síntese")
+    for k,v in pairs(Report.F_rotation.summary) do
+        W("    "..k.." : encontrado="..tostring(v.found).." ["..v.status.."]")
+    end
+    H2("Evidências ("..#Report.F_rotation.evidence..")")
+    for _, ev in ipairs(Report.F_rotation.evidence) do
+        W("    L"..ev.line.." ["..ev.script.."] "..ev.text)
+    end
+
+    -- G
+    H1("G. SISTEMA DE PORTAIS — confiança: "..Report.G_portals.confidence)
+    KV("Scripts relevantes encontrados", #Report.G_portals.scripts_found)
+    KV("Evidências criação", #Report.G_portals.creation_flow)
+    KV("Evidências posicionamento", #Report.G_portals.position_calc)
+    KV("Evidências orientação", #Report.G_portals.orientation_calc)
+    KV("Evidências superfície", #Report.G_portals.surface_selection)
+    KV("Evidências modelo", #Report.G_portals.model_creation)
+    KV("Evidências linkage", #Report.G_portals.portal_linkage)
+    KV("Evidências teleporte", #Report.G_portals.teleport_execution)
+    if #Report.G_portals.scripts_found > 0 then
+        H2("Scripts relacionados a portais")
+        for _, se in ipairs(Report.G_portals.scripts_found) do
+            W("    "..se.class.." : "..se.path.." ("..#se.hits.." hits)")
+            for _, h in ipairs(se.hits) do W("      L"..h.line.." ["..h.pattern.."] "..h.text) end
+        end
+    end
+    if #Report.G_portals.creation_flow > 0 then
+        H2("Fluxo de criação")
+        for _, ev in ipairs(Report.G_portals.creation_flow) do W("    L"..ev.line.." ["..ev.script.."] "..ev.text) end
+    end
+    if #Report.G_portals.teleport_execution > 0 then
+        H2("Execução do teleporte")
+        for _, ev in ipairs(Report.G_portals.teleport_execution) do W("    L"..ev.line.." ["..ev.script.."] "..ev.text) end
+    end
+
+    -- H
+    H1("H. TELEPORTE — confiança: "..Report.H_teleport.confidence)
+    KV("Evidências", #Report.H_teleport.evidence)
+    for _, ev in ipairs(Report.H_teleport.evidence) do
+        W("    L"..ev.line.." ["..ev.script.."] "..ev.text)
+    end
+
+    -- I
+    H1("I. COMUNICAÇÃO CLIENTE-SERVIDOR")
+    if #Report.I_remotes == 0 then W("  Nenhum RemoteEvent/RemoteFunction encontrado nas raízes acessíveis.") end
+    for _, rem in ipairs(Report.I_remotes) do
+        H2(rem.name.." ("..rem.class..")")
+        KV("Caminho", rem.path)
+        KV("Função aparente", rem.apparent_function)
+        KV("Handler servidor", rem.server_handler)
+        KV("Callers encontrados", #rem.callers)
+        for _, c in ipairs(rem.callers) do
+            W("    L"..c.line.." ["..c.pattern.."] "..c.script)
+        end
+    end
+
+    -- J
+    H1("J. AUDITORIA DE SEGURANÇA")
+    if #Report.J_security == 0 then W("  Nenhum problema encontrado nas raízes acessíveis.") end
+    for i, f in ipairs(Report.J_security) do
+        H2("["..i.."] "..f.severity.." — "..f.issue.." ["..f.status.."]")
+        KV("Arquivo", f.file)
+        KV("Impacto", f.impact)
+        KV("Evidência", f.evidence)
+        KV("Correção", f.fix)
+    end
+
+    -- K
+    H1("K. SCRIPTS MAPEADOS — total: "..#Report.K_scripts)
+    for _, s in ipairs(Report.K_scripts) do
+        W("  "..s.class.." | "..s.path.." | "..s.lines.." linhas")
+    end
+
+    -- L
+    H1("L. INFORMAÇÕES NÃO VERIFICADAS")
+    for _, note in ipairs(Report.L_unverified) do W("  • "..note) end
+
+    HR()
+    W("  FIM DO RELATÓRIO")
+    HR()
+
+    return table.concat(L, "\n")
+end
+
+-- ============================================================
+-- MONITOR PASSIVO
+-- ============================================================
+local Monitor = { active=false, connections={}, log={} }
+
+local function MonitorLog(cat, msg, data)
+    table.insert(Monitor.log, {time=tick(), category=cat, message=msg, data=data or {}})
+end
+
+local function StartMonitor()
+    if Monitor.active then return end
+    Monitor.active = true
+    for _, root in ipairs({Workspace, ReplicatedStorage or Workspace}) do
+        if root then
+            local c1 = root.DescendantAdded:Connect(function(o)
+                MonitorLog("ADDED",   o.Name.." → "..FullPath(root), {class=o.ClassName,path=FullPath(o)})
+            end)
+            local c2 = root.DescendantRemoving:Connect(function(o)
+                MonitorLog("REMOVED", o.Name.." ← "..FullPath(root), {class=o.ClassName})
+            end)
+            table.insert(Monitor.connections,c1)
+            table.insert(Monitor.connections,c2)
+        end
+    end
+    if LocalPlayer then
+        local function WatchPlayer(p)
+            p.CharacterAdded:Connect(function(char)
+                MonitorLog("CHAR_ADDED", p.Name, {player=p.Name})
+                char.ChildAdded:Connect(function(ch)
+                    if ch:IsA("Tool") then MonitorLog("TOOL_EQUIPPED",p.Name.." → "..ch.Name,{}) end
+                end)
+                char.ChildRemoved:Connect(function(ch)
+                    if ch:IsA("Tool") then MonitorLog("TOOL_REMOVED",p.Name.." ← "..ch.Name,{}) end
+                end)
+                local root = char:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local lastPos = root.Position
+                    local hc = RunService.Heartbeat:Connect(function()
+                        if not Monitor.active then return end
+                        local delta = (root.Position - lastPos).Magnitude
+                        if delta > 10 then
+                            MonitorLog("LARGE_MOVE",p.Name.." +"..string.format("%.1f",delta).." studs",{from=tostring(lastPos),to=tostring(root.Position)})
+                        end
+                        lastPos = root.Position
+                    end)
+                    table.insert(Monitor.connections, hc)
+                end
+            end)
+        end
+        for _,p in ipairs(Players:GetPlayers()) do WatchPlayer(p) end
+        local pac = Players.PlayerAdded:Connect(WatchPlayer)
+        table.insert(Monitor.connections, pac)
+    end
+    -- monitora portais no Workspace
+    local pc = Workspace.DescendantAdded:Connect(function(o)
+        if o.Name:lower():find("portal") then
+            MonitorLog("PORTAL_DETECTED", o.Name, {class=o.ClassName,path=FullPath(o)})
+        end
+    end)
+    table.insert(Monitor.connections, pc)
+end
+
+local function StopMonitor()
+    Monitor.active = false
+    for _, c in ipairs(Monitor.connections) do pcall(function() c:Disconnect() end) end
+    Monitor.connections = {}
+end
+
+-- ============================================================
+-- GUI MOBILE — botões grandes, touch-friendly
+-- ============================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = "DeepInspectorGUI"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local ok = pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
+if not ok then
+    ScreenGui.Parent = LocalPlayer and LocalPlayer:WaitForChild("PlayerGui") or Workspace
+end
+
+-- Frame principal
+local MainFrame = Instance.new("Frame", ScreenGui)
+MainFrame.Size             = UDim2.new(0, 300, 0, 520)
+MainFrame.Position         = UDim2.new(0.5, -150, 0.5, -260)
+MainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
+MainFrame.BorderSizePixel  = 0
+MainFrame.Active           = true
+MainFrame.Draggable        = true
+Instance.new("UICorner",MainFrame).CornerRadius = UDim.new(0,12)
+local MS = Instance.new("UIStroke",MainFrame)
+MS.Color = Color3.fromRGB(90,40,210); MS.Thickness = 1.4
+
+-- Barra de título
+local TBar = Instance.new("Frame",MainFrame)
+TBar.Size             = UDim2.new(1,0,0,42)
+TBar.BackgroundColor3 = Color3.fromRGB(55,20,145)
+TBar.BorderSizePixel  = 0
+Instance.new("UICorner",TBar).CornerRadius = UDim.new(0,12)
+local TLbl = Instance.new("TextLabel",TBar)
+TLbl.Size      = UDim2.new(1,-10,1,0)
+TLbl.Position  = UDim2.new(0,10,0,0)
+TLbl.Text      = "🔬 Deep Inspector"
+TLbl.TextColor3= Color3.fromRGB(230,220,255)
+TLbl.Font      = Enum.Font.GothamBold
+TLbl.TextSize  = 14
+TLbl.TextXAlignment = Enum.TextXAlignment.Left
+TLbl.BackgroundTransparency = 1
+
+-- Status label
+local StatusLbl = Instance.new("TextLabel",MainFrame)
+StatusLbl.Size       = UDim2.new(1,-10,0,22)
+StatusLbl.Position   = UDim2.new(0,5,0,46)
+StatusLbl.Text       = "Pronto. Toque em Auditar."
+StatusLbl.TextColor3 = Color3.fromRGB(160,200,255)
+StatusLbl.Font       = Enum.Font.Gotham
+StatusLbl.TextSize   = 12
+StatusLbl.BackgroundTransparency = 1
+
+-- Output scroll
+local OutputScroll = Instance.new("ScrollingFrame",MainFrame)
+OutputScroll.Size               = UDim2.new(1,-8,1,-200)
+OutputScroll.Position           = UDim2.new(0,4,0,72)
+OutputScroll.BackgroundColor3   = Color3.fromRGB(6,6,14)
+OutputScroll.BorderSizePixel    = 0
+OutputScroll.ScrollBarThickness = 3
+OutputScroll.ScrollBarImageColor3 = Color3.fromRGB(90,40,200)
+OutputScroll.AutomaticCanvasSize  = Enum.AutomaticSize.Y
+OutputScroll.CanvasSize           = UDim2.new(0,0,0,0)
+Instance.new("UICorner",OutputScroll).CornerRadius = UDim.new(0,6)
+local OP = Instance.new("UIPadding",OutputScroll)
+OP.PaddingLeft=UDim.new(0,5); OP.PaddingRight=UDim.new(0,5)
+OP.PaddingTop=UDim.new(0,5);  OP.PaddingBottom=UDim.new(0,5)
+local OutputLbl = Instance.new("TextLabel",OutputScroll)
+OutputLbl.Size = UDim2.new(1,0,0,0)
+OutputLbl.AutomaticSize = Enum.AutomaticSize.Y
+OutputLbl.Text = "Aguardando auditoria..."
+OutputLbl.TextColor3 = Color3.fromRGB(150,240,150)
+OutputLbl.Font = Enum.Font.Code
+OutputLbl.TextSize = 10
+OutputLbl.TextXAlignment = Enum.TextXAlignment.Left
+OutputLbl.TextYAlignment = Enum.TextYAlignment.Top
+OutputLbl.BackgroundTransparency = 1
+OutputLbl.TextWrapped = true
+
+-- Container de botões
+local BtnArea = Instance.new("Frame",MainFrame)
+BtnArea.Size = UDim2.new(1,-8,0,120)
+BtnArea.Position = UDim2.new(0,4,1,-125)
+BtnArea.BackgroundTransparency = 1
+
+local BtnGrid = Instance.new("UIGridLayout",BtnArea)
+BtnGrid.CellSize    = UDim2.new(0,136,0,52)
+BtnGrid.CellPadding = UDim2.new(0,6,0,6)
+BtnGrid.SortOrder   = Enum.SortOrder.LayoutOrder
+
+local function MakeBtn(label,color,order)
+    local b = Instance.new("TextButton",BtnArea)
+    b.Text             = label
+    b.BackgroundColor3 = color
+    b.TextColor3       = Color3.fromRGB(255,255,255)
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = 13
+    b.BorderSizePixel  = 0
+    b.AutoButtonColor  = false
+    b.LayoutOrder      = order
+    Instance.new("UICorner",b).CornerRadius = UDim.new(0,8)
+    return b
+end
+
+local BtnRun      = MakeBtn("▶ AUDITAR",        Color3.fromRGB(40,160,70),  1)
+local BtnMonStart = MakeBtn("⏺ MONITOR",        Color3.fromRGB(40,80,190),  2)
+local BtnMonStop  = MakeBtn("⏹ PARAR MON.",     Color3.fromRGB(140,80,20),  3)
+local BtnCopyTxt  = MakeBtn("📋 COPIAR DADOS",  Color3.fromRGB(80,30,180),  4)
+
+-- estado do relatório gerado
+local lastTextReport = nil
+local monitorRunning  = false
+
+-- set output helper (trunca na GUI mas preserva completo em lastTextReport)
+local function SetOutput(txt)
+    local display = #txt > 7000 and (txt:sub(1,7000).."\n\n... (truncado aqui — use COPIAR DADOS para o completo)") or txt
+    OutputLbl.Text = display
+end
+
+local function SetStatus(txt, color)
+    StatusLbl.Text       = txt
+    StatusLbl.TextColor3 = color or Color3.fromRGB(160,200,255)
+end
+
+-- ============================================================
+-- BOTÃO — AUDITAR
+-- ============================================================
+BtnRun.MouseButton1Click:Connect(function()
+    SetStatus("⏳ Executando auditoria...", Color3.fromRGB(255,220,80))
+    task.wait(0.05)
+
+    local ok2, err = pcall(function()
+        RunA(); RunB(); RunC(); RunD(); RunE()
+        RunF(); RunG(); RunH(); RunI(); RunJ()
+    end)
+
+    if not ok2 then
+        SetStatus("❌ ERRO: "..tostring(err), Color3.fromRGB(255,80,80))
+        SetOutput("Erro durante auditoria:\n"..tostring(err))
+        return
+    end
+
+    lastTextReport = BuildTextReport()
+    SetOutput(lastTextReport)
+    SetStatus("✅ Auditoria concluída — "..#Report.K_scripts.." scripts | "..#Report.J_security.." achados sec.", Color3.fromRGB(100,255,130))
+end)
+
+-- ============================================================
+-- BOTÃO — MONITOR
+-- ============================================================
+BtnMonStart.MouseButton1Click:Connect(function()
+    if monitorRunning then
+        SetStatus("⚠ Monitor já ativo.", Color3.fromRGB(255,200,80))
+        return
+    end
+    StartMonitor()
+    monitorRunning = true
+    SetStatus("⏺ Monitor ativo — "..#Monitor.connections.." conexões", Color3.fromRGB(100,160,255))
+end)
+
+BtnMonStop.MouseButton1Click:Connect(function()
+    StopMonitor()
+    monitorRunning = false
+    -- adiciona log do monitor ao relatório de texto
+    local logLines = { "\n\n══════════════════════════════════", "  MONITOR LOG — "..#Monitor.log.." entradas", "══════════════════════════════════" }
+    for _, e in ipairs(Monitor.log) do
+        table.insert(logLines, string.format("  [%s] %.1f  %s", e.category, e.time, e.message))
+    end
+    local logTxt = table.concat(logLines, "\n")
+    if lastTextReport then
+        lastTextReport = lastTextReport .. logTxt
+    else
+        lastTextReport = logTxt
+    end
+    SetStatus("⏹ Monitor parado — "..#Monitor.log.." entradas registradas", Color3.fromRGB(255,180,80))
+    SetOutput(lastTextReport or logTxt)
+end)
+
+-- ============================================================
+-- BOTÃO — COPIAR DADOS (setclipboard nativo do Delta)
+-- ============================================================
+BtnCopyTxt.MouseButton1Click:Connect(function()
+    if not lastTextReport then
+        SetStatus("⚠ Execute a auditoria primeiro.", Color3.fromRGB(255,180,60))
+        return
+    end
+
+    -- tenta setclipboard (Delta, Synapse, Script-Ware, etc.)
+    local copied = false
+    local ok3 = pcall(function()
+        setclipboard(lastTextReport)
+        copied = true
+    end)
+
+    if not copied then
+        -- fallback: imprime no output do executor para copiar manual
+        print("[DeepInspector] ===== INÍCIO DO RELATÓRIO — COPIE ABAIXO =====")
+        print(lastTextReport)
+        print("[DeepInspector] ===== FIM DO RELATÓRIO =====")
+        SetStatus("📋 Relatório no Output (setclipboard indisponível)", Color3.fromRGB(255,200,80))
+    else
+        SetStatus("✅ Dados copiados para a área de transferência!", Color3.fromRGB(100,255,130))
+    end
+end)
+
+-- ============================================================
+-- FIM
+-- ============================================================
