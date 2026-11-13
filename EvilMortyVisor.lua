@@ -437,14 +437,14 @@ local DIM_ATTR_KEYS = {
 -- Returns: code string or nil
 local function extractFromHudText(text)
     if not text or text == "" then return nil end
-    -- Must contain the owner tag "(SUA)" or contain a dimension code pattern
-    local hasSua = text:find(OWNER_TAG_PAT) ~= nil
-    local code   = extractDimCode(text)
-    if code and hasSua then
-        return code, "CONFIRMED"   -- "(SUA)" confirms it is the local player's dimension
-    elseif code then
-        return code, "OBSERVED"
+    -- Only accept the specific local dimension HUD form. A random label
+    -- containing a token such as A-12 is not sufficient evidence.
+    local lower = tostring(text):lower()
+    if not lower:find("dimens", 1, true) or not text:find(OWNER_TAG_PAT) then
+        return nil, nil
     end
+    local code = extractDimCode(text)
+    if code then return code, "OBSERVED" end
     return nil, nil
 end
 
@@ -476,10 +476,8 @@ function DS.scan(player)
         local v = player:GetAttribute(k)
         if v ~= nil then
             local raw = tostring(v)
-            local code = isSentence(raw) and extractDimCode(raw) or (extractDimCode(raw) or raw)
-            if code and code ~= "" then
-                return makeRecord("dimension", code, "PA:" .. k, STATUS.OBSERVED)
-            end
+            local code = strictParseCode(raw)
+            if code then return makeRecord("dimension", code, "PA:" .. k, STATUS.OBSERVED) end
         end
     end
 
@@ -489,10 +487,8 @@ function DS.scan(player)
             local n = v.Name:lower()
             if n:find("dim") or n:find("portal") or n:find("world") then
                 local raw = tostring(v.Value)
-                local code = extractDimCode(raw) or (not isSentence(raw) and raw or nil)
-                if code and code ~= "" then
-                    return makeRecord("dimension", code, "PV:" .. v.Name, STATUS.OBSERVED)
-                end
+                local code = strictParseCode(raw)
+                if code then return makeRecord("dimension", code, "PV:" .. v.Name, STATUS.OBSERVED) end
             end
         end
     end
@@ -504,10 +500,8 @@ function DS.scan(player)
             local v = char:GetAttribute(k)
             if v ~= nil then
                 local raw = tostring(v)
-                local code = isSentence(raw) and extractDimCode(raw) or (extractDimCode(raw) or raw)
-                if code and code ~= "" then
-                    return makeRecord("dimension", code, "CA:" .. k, STATUS.OBSERVED)
-                end
+                local code = strictParseCode(raw)
+                if code then return makeRecord("dimension", code, "CA:" .. k, STATUS.OBSERVED) end
             end
         end
 
@@ -517,10 +511,8 @@ function DS.scan(player)
                 local n = v.Name:lower()
                 if n:find("dim") or n:find("portal") or n:find("world") then
                     local raw = tostring(v.Value)
-                    local code = extractDimCode(raw) or (not isSentence(raw) and raw or nil)
-                    if code and code ~= "" then
-                        return makeRecord("dimension", code, "CV:" .. v.Name, STATUS.OBSERVED)
-                    end
+                    local code = strictParseCode(raw)
+                    if code then return makeRecord("dimension", code, "CV:" .. v.Name, STATUS.OBSERVED) end
                 end
             end
         end
@@ -700,22 +692,9 @@ function ENV.scanGarages(player)
 end
 
 function ENV.getGarageStatus(player)
-    local pos = PS.getPos(player)
-    if not pos then return UNKNOWN_REC("garage") end
-
-    local ok, regions, ownerConfirmed = pcall(ENV.scanGarages, player)
-    if not ok or not regions or #regions == 0 then
-        return makeRecord("garage", "UNKNOWN", "none", STATUS.UNKNOWN)
-    end
-
-    for _, region in ipairs(regions) do
-        if isInsideRegion(region, pos) then
-            local conf = ownerConfirmed and STATUS.CONFIRMED or STATUS.OBSERVED
-            return makeRecord("garage", "IN GARAGE", "spatial", conf)
-        end
-    end
-    local conf = ownerConfirmed and STATUS.CONFIRMED or STATUS.OBSERVED
-    return makeRecord("garage", "OUTSIDE", "spatial", conf)
+    -- No verified Portal Sandbox garage model, ownership field or region
+    -- has been established. Never infer IN/OUTSIDE from generic geometry.
+    return makeRecord("garage", "UNKNOWN", "unverified-game-structure", STATUS.UNKNOWN)
 end
 
 -- ══════════════════════════════════════════════════════════════════════
@@ -740,7 +719,7 @@ local function getVisibility(player)
         end
     end
     if total > 0 and vis == 0 then
-        return makeRecord("visibility", "NOT VISIBLE", "transparency", STATUS.OBSERVED)
+        return makeRecord("visibility", "UNKNOWN", "all-character-parts-transparent", STATUS.UNKNOWN)
     end
 
     -- Distance gate
@@ -904,12 +883,16 @@ end
 --   Left:   10px  (small margin)
 --   Right:  185px (clear of action buttons)
 local function safeLayout()
-    local vp = Camera.ViewportSize
-    local W  = math.min(math.max(vp.X - 195, 280), 420)
-    local H  = math.min(math.max(vp.Y - 185, 300), 500)
-    -- Prefer bottom-left (avoids right-side action buttons)
-    local x  = 6
-    local y  = math.max(70, vp.Y - H - 115)
+    local vp = Camera and Camera.ViewportSize or Vector2.new(800, 600)
+    -- Compact optical instrument, not a full-screen rectangular menu.
+    local W = math.clamp(math.floor(vp.X * 0.30), 250, 330)
+    local H = math.clamp(math.floor(vp.Y * 0.48), 300, 410)
+    -- Dock on the right, but reserve the outer action-button column.
+    local rightReserve = vp.X < 700 and 12 or math.clamp(math.floor(vp.X * 0.145), 120, 220)
+    local x = math.max(6, vp.X - W - rightReserve)
+    local y = math.clamp(math.floor((vp.Y - H) * 0.48), 76, math.max(76, vp.Y - H - 105))
+    -- Very narrow screens: move to the left-side free lane rather than cover jump/actions.
+    if vp.X < 560 then x = 8; W = math.min(W, math.max(230, vp.X - 24)) end
     return UDim2.new(0, x, 0, y), W, H
 end
 
@@ -987,7 +970,7 @@ local function CreateLensFrame(parent, W, H)
     uiStroke(lens, C.goldDim, 2)
 
     -- Vignette (black edge fade via nested rounded frame)
-    local vignette = uiFr(lens, UDim2.new(1,0,1,0), nil, Color3.new(0,0,0), 0.55)
+    local vignette = uiFr(lens, UDim2.new(1,0,1,0), nil, Color3.new(0,0,0), 0.88)
     uiCorner(vignette, lensSize // 2)
 
     -- Outer ring (static, faint)
@@ -1022,7 +1005,7 @@ end
 local modeBtnRefs = {}
 
 local function CreateSideMenu(parent, h, onMode, onMinimize, onClose, onToggleFX)
-    local menuW = 90
+    local menuW = 68
     local menu = uiFr(parent, UDim2.new(0,menuW,0,h), UDim2.new(0,0,0,0), C.black, 0.3)
     uiStroke(menu, C.goldLo, 1); uiCorner(menu, 4)
 
@@ -1038,7 +1021,7 @@ local function CreateSideMenu(parent, h, onMode, onMinimize, onClose, onToggleFX
     local btnH = 42
     for i, m in ipairs(modes) do
         local b = uiBtn(menu, m.label,
-            UDim2.new(1,-8,0,btnH), UDim2.new(0,4,0,22+(i-1)*(btnH+4)),
+            UDim2.new(1,-6,0,btnH), UDim2.new(0,3,0,22+(i-1)*(btnH+4)),
             C.goldLo, C.goldDim,
             function() onMode(m.name) end)
         b.TextSize = 9; b.TextWrapped = true; b.TextYAlignment = Enum.TextYAlignment.Center
@@ -1432,7 +1415,7 @@ function RefreshSystemDiagnostics()
             if r.replicated                        then replCount += 1 end
             if r.dimension.status ~= STATUS.UNKNOWN then dimCount  += 1 end
             if r.garage.value     == "IN GARAGE"   then garCount  += 1 end
-            if r.portalGun.value ~= "UNKNOWN" and r.portalGun.value ~= "UNKNOWN" then pgCount += 1 end
+            if r.portalGun.value ~= "UNKNOWN" and r.portalGun.status ~= STATUS.NOT_REPLICATED then pgCount += 1 end
         end
     end
 
@@ -1708,19 +1691,19 @@ function CreateOpticalInterface()
     local pos, W, H = safeLayout()
 
     -- Main container
-    local mainFr = uiFr(SG, UDim2.new(0,W,0,H), pos, C.black)
-    mainFr.Active = false   -- body passes through touch → camera unaffected
-    uiCorner(mainFr, 6); uiStroke(mainFr, C.goldDim, 1)
+    local mainFr = uiFr(SG, UDim2.new(0,W,0,H), pos, C.black, 1)
+    mainFr.Active = false
+    mainFr.BackgroundTransparency = 1
     lensFrame = mainFr
 
     -- Header strip
-    local hdr = uiFr(mainFr, UDim2.new(1,0,0,22), nil, C.bgHdr)
+    local hdr = uiFr(mainFr, UDim2.new(1,0,0,22), nil, C.bgHdr, 0.18)
     hdr.Active = true   -- header absorbs input for drag
     uiCorner(hdr, 4)
     uiFr(hdr, UDim2.new(1,0,0,6), UDim2.new(0,0,1,-6), C.bgHdr)   -- flatten bottom corners
 
     local blinkL = uiLbl(hdr, "◆", UDim2.new(0,14,1,0), UDim2.new(0,4,0,0), C.gold, 11)
-    uiLbl(hdr, "EM·OPTICAL INTERFACE", UDim2.new(1,-80,1,0), UDim2.new(0,22,0,0), C.gold, 10)
+    uiLbl(hdr, "EM·OPTICAL VISOR", UDim2.new(1,-80,1,0), UDim2.new(0,22,0,0), C.gold, 10)
     local subL = uiLbl(hdr, "MULTIVERSE SCAN", UDim2.new(0,120,1,0), UDim2.new(0,22,0,0), C.goldDim, 8)
     -- (subL is below title — position offset by title height)
     subL.Position = UDim2.new(0,22,0,11)
@@ -1740,7 +1723,8 @@ function CreateOpticalInterface()
 
     -- Content area below header
     local contentH = H - 22
-    local content = uiFr(mainFr, UDim2.new(1,0,0,contentH), UDim2.new(0,0,0,22), C.black, 0.05)
+    local content = uiFr(mainFr, UDim2.new(1,0,0,contentH), UDim2.new(0,0,0,22), C.black, 1)
+    content.BackgroundTransparency = 1
     content.ClipDescendants = true
 
     -- Side menu
@@ -1760,7 +1744,14 @@ function CreateOpticalInterface()
 
     -- Mode content area
     local ca, cW = makeContentArea(content, menuW, W, contentH)
+    ca.BackgroundTransparency = 1
     local cH = contentH
+
+    -- The optical lens is a real part of the assembled HUD, behind mode layers.
+    -- Previously CreateLensFrame existed but was never mounted, leaving a blank box.
+    local opticalLens, opticalLensSize = CreateLensFrame(ca, cW, cH)
+    opticalLens.Name = "OpticalLens"
+    opticalLens.ZIndex = 1
 
     -- Build all three modes
     local proxF, detLbl = RenderProximityScan(ca, cW, cH)
@@ -1779,11 +1770,13 @@ function CreateOpticalInterface()
     BuildMiniBadge(SG, mainFr)
 
     -- ViewportSize change
-    addConn(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-        local np, nW, nH = safeLayout()
-        mainFr.Position = np
-        mainFr.Size = UDim2.new(0, nW, 0, nH)
-    end))
+    if Camera then
+        addConn(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            local np, nW, nH = safeLayout()
+            mainFr.Position = np
+            mainFr.Size = UDim2.new(0, nW, 0, nH)
+        end))
+    end
 
     logEv("[SYS] EM OPTICAL VISOR v4.0 ONLINE", C.gold)
     logEv("[SYS] CLIENT-SIDE — READ ONLY",        C.goldDim)
